@@ -1,0 +1,13 @@
+Month,Product,Sales,Units,Region
+Jan,Laptop,38000,76,North
+Jan,Phone,41000,205,South
+Jan,Tablet,22000,88,East
+Feb,Laptop,44000,88,North
+Feb,Phone,35000,175,South
+Feb,Tablet,19000,76,East
+Mar,Laptop,55000,110,North
+Mar,Phone,42000,210,West
+Mar,Tablet,17000,68,East
+Apr,Laptop,51000,102,North
+Apr,Phone,38000,190,South
+Apr,Tablet,26000,104,West
