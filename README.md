@@ -156,7 +156,7 @@ AI-Data-Agent/
 
 ## 👤 Author
 
-**Jamil** ([@Legitbosz](https://github.com/Legitbosz))  
+([@Legitbosz](https://github.com/Legitbosz))  
 Web3 Developer & AI Builder
 
 ---
