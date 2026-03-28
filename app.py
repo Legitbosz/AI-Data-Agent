@@ -7,6 +7,13 @@ from agent import analyze_data, analyze_two_datasets, run_analysis_code
 from exporters import export_to_excel, export_to_word, export_to_pptx
 from cleaner import clean_dataframe, get_data_quality_report
 
+# ── Tesseract OCR path (Windows) ─────────────────────────────────────────────
+try:
+    import pytesseract
+    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+except ImportError:
+    pass  # OCR won't be available but app still works
+
 st.set_page_config(page_title="AI Data Analysis Agent", layout="wide")
 
 # ── Theme toggle ──────────────────────────────────────────────────────────────
@@ -630,7 +637,7 @@ st.markdown(f"""
     <div class="agent-header-inner">
         <div>
             <p class="agent-title">🤖 AI Data Analysis Agent</p>
-            <p class="agent-subtitle">Upload any dataset &nbsp;·&nbsp; Ask in plain English &nbsp;·&nbsp; Export to Excel, Word & PowerPoint</p>
+            <p class="agent-subtitle">Upload CSV, Excel & PDF &nbsp;·&nbsp; Ask in plain English &nbsp;·&nbsp; Export to Excel, Word & PowerPoint</p>
             <span class="agent-badge">⚡ Powered by Claude AI (Anthropic)</span>
         </div>
     </div>
@@ -651,17 +658,212 @@ for key, default in {
 def load_file(uploaded, header_row=0):
     if uploaded.name.endswith(".csv"):
         df = pd.read_csv(uploaded, header=header_row)
+    elif uploaded.name.endswith(".pdf"):
+        dfs = load_pdf_tables(uploaded)
+        if not dfs:
+            raise ValueError("No tables found in this PDF.")
+        df = dfs[0]
     else:
         df = pd.read_excel(uploaded, header=header_row)
-    # Clean column names — strip whitespace and non-breaking spaces
-    df.columns = df.columns.astype(str).str.replace(r'[ \s]+', ' ', regex=True).str.strip()
+    df.columns = df.columns.astype(str).str.replace(r'[\s]+', ' ', regex=True).str.strip()
     return df
+
+
+def _clean_pdf_df(df):
+    """Clean a DataFrame extracted from PDF: fix columns, convert numerics."""
+    df = df.dropna(how='all').dropna(axis=1, how='all')
+    # Drop columns that are entirely empty strings
+    df = df.loc[:, ~(df.astype(str).eq('').all())]
+    for col in df.columns:
+        cleaned = df[col].astype(str).str.replace(r'[\u20a6$\u20ac\u00a3,\s]', '', regex=True)
+        try:
+            numeric = pd.to_numeric(cleaned, errors='coerce')
+            if numeric.notna().sum() > len(df) * 0.5:
+                df[col] = numeric
+        except Exception:
+            pass
+    return df
+
+
+def _ocr_pdf_to_tables(uploaded):
+    """OCR fallback: convert PDF pages to images, run Tesseract, parse tables."""
+    import logging
+    tables = []
+
+    try:
+        from pdf2image import convert_from_bytes
+        import pytesseract
+    except ImportError as e:
+        logging.warning(f"[PDF-OCR] Missing library: {e}. Install pdf2image and pytesseract.")
+        return tables
+
+    uploaded.seek(0)
+    pdf_bytes = uploaded.read()
+    uploaded.seek(0)
+
+    try:
+        images = convert_from_bytes(pdf_bytes, dpi=300)
+    except Exception as e:
+        logging.warning(f"[PDF-OCR] pdf2image failed: {e}")
+        return tables
+
+    for page_num, img in enumerate(images, start=1):
+        try:
+            # Try to get structured table data via Tesseract TSV output
+            tsv_text = pytesseract.image_to_data(img, output_type=pytesseract.Output.DATAFRAME)
+            # Filter to meaningful text
+            tsv_text = tsv_text[tsv_text['text'].notna() & (tsv_text['text'].astype(str).str.strip() != '')]
+
+            if len(tsv_text) < 3:
+                continue
+
+            # Group by block/line to reconstruct rows
+            rows = []
+            for (block, par, line), group in tsv_text.groupby(['block_num', 'par_num', 'line_num']):
+                row_text = group.sort_values('left')['text'].astype(str).tolist()
+                if row_text:
+                    rows.append(row_text)
+
+            if len(rows) < 2:
+                continue
+
+            # Normalize: find the most common row length (likely table width)
+            from collections import Counter
+            lengths = Counter(len(r) for r in rows)
+            most_common_len = lengths.most_common(1)[0][0]
+
+            # Filter rows that match the most common length (likely table rows)
+            table_rows = [r for r in rows if len(r) == most_common_len]
+
+            if len(table_rows) < 2:
+                # Fall back: pad/trim all rows to most common length
+                table_rows = []
+                for r in rows:
+                    if len(r) >= most_common_len:
+                        table_rows.append(r[:most_common_len])
+                    elif len(r) >= most_common_len - 1:
+                        table_rows.append(r + [''] * (most_common_len - len(r)))
+
+            if len(table_rows) < 2:
+                continue
+
+            header = [str(c).strip() if c else f"Col_{i}" for i, c in enumerate(table_rows[0])]
+            df = pd.DataFrame(table_rows[1:], columns=header)
+            df = _clean_pdf_df(df)
+
+            if len(df) > 0 and len(df.columns) > 0:
+                df.attrs['_pdf_source'] = f"Page {page_num} (OCR)"
+                tables.append(df)
+
+        except Exception as e:
+            logging.warning(f"[PDF-OCR] Page {page_num} failed: {e}")
+            continue
+
+    # If structured approach failed, try plain text OCR
+    if not tables:
+        try:
+            all_text = []
+            for img in images:
+                text = pytesseract.image_to_string(img)
+                if text and text.strip():
+                    all_text.append(text.strip())
+
+            if all_text:
+                from io import StringIO
+                combined = '\n'.join(all_text)
+                lines = [l for l in combined.split('\n') if l.strip()]
+                if len(lines) >= 2:
+                    try:
+                        df = pd.read_csv(StringIO('\n'.join(lines)), sep=r'\s{2,}', engine='python')
+                        if len(df) > 0 and len(df.columns) > 1:
+                            df = _clean_pdf_df(df)
+                            df.attrs['_pdf_source'] = "Full OCR text"
+                            tables.append(df)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logging.warning(f"[PDF-OCR] Plain text fallback failed: {e}")
+
+    return tables
+
+
+def load_pdf_tables(uploaded):
+    """
+    Extract tables from PDF using a 3-tier approach:
+    1. pdfplumber (fast, for native/digital PDFs)
+    2. pdfplumber text extraction (for text-only PDFs without table structure)
+    3. OCR via pytesseract (for scanned/image PDFs)
+    """
+    import pdfplumber
+    import logging
+
+    uploaded.seek(0)
+    all_tables = []
+
+    # ── Tier 1: pdfplumber table extraction ──
+    with pdfplumber.open(uploaded) as pdf:
+        for page_num, page in enumerate(pdf.pages, start=1):
+            tables = page.extract_tables()
+            for t_idx, table in enumerate(tables):
+                if not table or len(table) < 2:
+                    continue
+                header = [str(c).strip() if c else f"Col_{i}" for i, c in enumerate(table[0])]
+                rows = table[1:]
+                df = pd.DataFrame(rows, columns=header)
+                df = _clean_pdf_df(df)
+                if len(df) > 0 and len(df.columns) > 0:
+                    df.attrs['_pdf_source'] = f"Page {page_num}, Table {t_idx + 1}"
+                    all_tables.append(df)
+
+    if all_tables:
+        uploaded.seek(0)
+        return all_tables
+
+    # ── Tier 2: pdfplumber text extraction ──
+    uploaded.seek(0)
+    with pdfplumber.open(uploaded) as pdf:
+        lines_txt = []
+        has_text = False
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text and text.strip():
+                has_text = True
+                lines_txt.extend(text.strip().split('\n'))
+
+        if lines_txt:
+            from io import StringIO
+            text_block = '\n'.join(lines_txt)
+            try:
+                df = pd.read_csv(StringIO(text_block), sep=r'\s{2,}', engine='python')
+                if len(df) > 0 and len(df.columns) > 1:
+                    df = _clean_pdf_df(df)
+                    df.attrs['_pdf_source'] = "Text extraction"
+                    all_tables.append(df)
+            except Exception:
+                pass
+
+    if all_tables:
+        uploaded.seek(0)
+        return all_tables
+
+    # ── Tier 3: OCR fallback (for scanned/image PDFs) ──
+    logging.info("[PDF] No tables found via text extraction, trying OCR...")
+    uploaded.seek(0)
+    ocr_tables = _ocr_pdf_to_tables(uploaded)
+    all_tables.extend(ocr_tables)
+
+    uploaded.seek(0)
+    return all_tables
+
+
 
 
 def preview_raw(uploaded, n=10):
     try:
         uploaded.seek(0)
-        if uploaded.name.endswith(".csv"):
+        if uploaded.name.endswith(".pdf"):
+            return None  # PDF preview handled separately
+        elif uploaded.name.endswith(".csv"):
             return pd.read_csv(uploaded, header=None, nrows=n)
         else:
             return pd.read_excel(uploaded, header=None, nrows=n)
@@ -671,43 +873,118 @@ def preview_raw(uploaded, n=10):
         uploaded.seek(0)
 
 
+def _handle_pdf_upload(uploaded, slot_prefix, col_widget):
+    """Handle PDF upload with multi-table support. Returns True if loaded."""
+    uploaded.seek(0)
+    with col_widget.status("Extracting data from PDF...", expanded=True) as status:
+        st.write("Trying direct table extraction...")
+        pdf_tables = load_pdf_tables(uploaded)
+        uploaded.seek(0)
+        if pdf_tables:
+            src = pdf_tables[0].attrs.get('_pdf_source', '')
+            if 'OCR' in src:
+                status.update(label="Extracted via OCR (scanned PDF)", state="complete")
+            elif 'Text' in src:
+                status.update(label="Extracted from text content", state="complete")
+            else:
+                status.update(label="Extracted structured tables", state="complete")
+        else:
+            status.update(label="No data found", state="error")
+
+    if not pdf_tables:
+        col_widget.warning(
+            "No tables found in this PDF. If it's a scanned/image PDF, "
+            "make sure **Tesseract OCR** and **Poppler** are installed on your system."
+        )
+        return False
+
+    base_name = uploaded.name.rsplit(".", 1)[0]
+
+    if len(pdf_tables) == 1:
+        df = pdf_tables[0]
+        st.session_state[f"df{slot_prefix}"] = df
+        st.session_state[f"name{slot_prefix}"] = base_name
+        col_widget.success(f"Loaded: {df.shape[0]} rows x {df.shape[1]} cols")
+        col_widget.dataframe(df.head(5), width='stretch')
+        return True
+    else:
+        col_widget.info(f"Found **{len(pdf_tables)} tables** in PDF")
+
+        # Show all tables with selection
+        table_labels = []
+        for i, df in enumerate(pdf_tables):
+            src = df.attrs.get('_pdf_source', f'Table {i+1}')
+            table_labels.append(f"{src} ({df.shape[0]} rows x {df.shape[1]} cols)")
+
+        selected = col_widget.selectbox(
+            "Select table to analyze:",
+            range(len(pdf_tables)),
+            format_func=lambda i: table_labels[i],
+            key=f"pdf_table_select_{slot_prefix}"
+        )
+
+        df = pdf_tables[selected]
+        st.session_state[f"df{slot_prefix}"] = df
+        st.session_state[f"name{slot_prefix}"] = f"{base_name} - {table_labels[selected].split(' (')[0]}"
+        col_widget.success(f"Loaded: {df.shape[0]} rows x {df.shape[1]} cols")
+        col_widget.dataframe(df.head(5), width='stretch')
+
+        # Also store all tables so user can switch later
+        st.session_state[f"_pdf_tables_{slot_prefix}"] = pdf_tables
+
+        # Show previews of other tables in an expander
+        with col_widget.expander(f"Preview all {len(pdf_tables)} tables"):
+            for i, tdf in enumerate(pdf_tables):
+                src = tdf.attrs.get('_pdf_source', f'Table {i+1}')
+                st.markdown(f"**{src}** ({tdf.shape[0]} rows x {tdf.shape[1]} cols)")
+                st.dataframe(tdf.head(3), width='stretch')
+                st.divider()
+        return True
+
+
 # ── MAIN AREA: uploaders run first so session_state is populated ───────────────
 st.subheader("Upload Files")
 col1, col2 = st.columns(2)
 
 with col1:
     st.markdown("**File 1**")
-    file1 = st.file_uploader("Upload first file", type=["csv","xlsx","xls"], key="file1")
+    file1 = st.file_uploader("Upload first file", type=["csv","xlsx","xls","pdf"], key="file1")
     if file1:
-        raw1 = preview_raw(file1)
-        st.session_state._raw1      = raw1
-        st.session_state._file1_obj = file1
-        if raw1 is not None:
-            st.markdown("**Preview (raw):**")
-            st.dataframe(raw1, width='stretch')
-        file1.seek(0)
-        header1 = int(st.session_state.get("header1_sb", 0) or 0) if isinstance(st.session_state.get("header1_sb", 0), int) else 0
-        st.session_state.df1   = load_file(file1, header1)
-        st.session_state.name1 = file1.name.rsplit(".", 1)[0]
-        st.success(f"Loaded: {st.session_state.df1.shape[0]} rows x {st.session_state.df1.shape[1]} cols")
-        st.dataframe(st.session_state.df1.head(5), width='stretch')
+        if file1.name.endswith(".pdf"):
+            _handle_pdf_upload(file1, "1", col1)
+        else:
+            raw1 = preview_raw(file1)
+            st.session_state._raw1      = raw1
+            st.session_state._file1_obj = file1
+            if raw1 is not None:
+                st.markdown("**Preview (raw):**")
+                st.dataframe(raw1, width='stretch')
+            file1.seek(0)
+            header1 = int(st.session_state.get("header1_sb", 0) or 0) if isinstance(st.session_state.get("header1_sb", 0), int) else 0
+            st.session_state.df1   = load_file(file1, header1)
+            st.session_state.name1 = file1.name.rsplit(".", 1)[0]
+            st.success(f"Loaded: {st.session_state.df1.shape[0]} rows x {st.session_state.df1.shape[1]} cols")
+            st.dataframe(st.session_state.df1.head(5), width='stretch')
 
 with col2:
-    st.markdown("**File 2 (optional — for comparison)**")
-    file2 = st.file_uploader("Upload second file", type=["csv","xlsx","xls"], key="file2")
+    st.markdown("**File 2 (optional \u2014 for comparison)**")
+    file2 = st.file_uploader("Upload second file", type=["csv","xlsx","xls","pdf"], key="file2")
     if file2:
-        raw2 = preview_raw(file2)
-        st.session_state._raw2      = raw2
-        st.session_state._file2_obj = file2
-        if raw2 is not None:
-            st.markdown("**Preview (raw):**")
-            st.dataframe(raw2, width='stretch')
-        file2.seek(0)
-        header2 = int(st.session_state.get("header2_sb", 0) or 0) if isinstance(st.session_state.get("header2_sb", 0), int) else 0
-        st.session_state.df2   = load_file(file2, header2)
-        st.session_state.name2 = file2.name.rsplit(".", 1)[0]
-        st.success(f"Loaded: {st.session_state.df2.shape[0]} rows x {st.session_state.df2.shape[1]} cols")
-        st.dataframe(st.session_state.df2.head(5), width='stretch')
+        if file2.name.endswith(".pdf"):
+            _handle_pdf_upload(file2, "2", col2)
+        else:
+            raw2 = preview_raw(file2)
+            st.session_state._raw2      = raw2
+            st.session_state._file2_obj = file2
+            if raw2 is not None:
+                st.markdown("**Preview (raw):**")
+                st.dataframe(raw2, width='stretch')
+            file2.seek(0)
+            header2 = int(st.session_state.get("header2_sb", 0) or 0) if isinstance(st.session_state.get("header2_sb", 0), int) else 0
+            st.session_state.df2   = load_file(file2, header2)
+            st.session_state.name2 = file2.name.rsplit(".", 1)[0]
+            st.success(f"Loaded: {st.session_state.df2.shape[0]} rows x {st.session_state.df2.shape[1]} cols")
+            st.dataframe(st.session_state.df2.head(5), width='stretch')
 
 if st.session_state.df1 is not None and st.session_state.df2 is not None:
     st.info(f"Comparison mode: **{st.session_state.name1}** vs **{st.session_state.name2}**")
