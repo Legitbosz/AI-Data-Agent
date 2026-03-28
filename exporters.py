@@ -3,6 +3,7 @@ import os
 import io
 import re
 import zipfile
+from xml.sax.saxutils import escape as xml_escape
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.chart import BarChart, Reference
@@ -13,8 +14,25 @@ from pptx import Presentation
 from pptx.util import Inches as PInches, Pt as PPt
 from pptx.chart.data import ChartData
 from pptx.enum.chart import XL_CHART_TYPE
+from pptx.dml.color import RGBColor as PptxRGB
 
 COLS = "BCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+# Vibrant chart color palette (hex without #, used across Excel XML and PPTX)
+CHART_COLORS = [
+    "2563EB",  # blue
+    "F97316",  # orange
+    "16A34A",  # green
+    "EF4444",  # red
+    "8B5CF6",  # purple
+    "EC4899",  # pink
+    "14B8A6",  # teal
+    "F59E0B",  # amber
+    "6366F1",  # indigo
+    "06B6D4",  # cyan
+    "84CC16",  # lime
+    "D946EF",  # fuchsia
+]
 
 
 # ── PPTX helpers ──────────────────────────────────────────────────────────────
@@ -148,7 +166,7 @@ def fix_chart_values(cd, df):
                 if all(cat in col_vals for cat in cats_norm):
                     num_col = best_numeric_col(num_cols, sname)
                     logging.warning(f"[fix_chart_values] groupby col='{col}', num_col='{num_col}' for series='{sname}'")
-                    grouped = df_clean.groupby(col)[num_col].sum()
+                    grouped = df_clean.groupby(col, observed=False)[num_col].sum()
                     fixed[sname] = [float(grouped.get(cat, 0)) for cat in cats_norm]
                     matched = True
                     break
@@ -213,7 +231,7 @@ def resolve_all_charts(analysis, df):
         text_cols = df.select_dtypes(exclude="number").columns.tolist()
         num_cols  = df.select_dtypes(include="number").columns.tolist()
         if text_cols and num_cols:
-            g = df.groupby(text_cols[0])[num_cols[0]].sum().reset_index()
+            g = df.groupby(text_cols[0], observed=False)[num_cols[0]].sum().reset_index()
             result.append({
                 "title":        analysis.get("chart_title", "Chart") if analysis else "Chart",
                 "categories":   g[text_cols[0]].astype(str).tolist(),
@@ -233,6 +251,11 @@ def build_chart_xml(ws_title, categories, series, chart_title,
                     data_start_row=1):
     """Build correct OOXML chart from scratch — bypasses all openpyxl XML bugs."""
     n = len(categories)
+
+    # Escape text values for XML safety (handles <, >, & in category names etc.)
+    chart_title = xml_escape(str(chart_title))
+    x_title     = xml_escape(str(x_title))
+    y_title     = xml_escape(str(y_title))
 
     # Row references — defined here so all chart types can use them
     hdr_row  = data_start_row
@@ -262,13 +285,39 @@ def build_chart_xml(ws_title, categories, series, chart_title,
     for i, (sname, vals) in enumerate(series.items()):
         col_letter = COLS[i]
         pts     = "".join(f'<c:pt idx="{j}"><c:v>{v}</c:v></c:pt>' for j, v in enumerate(vals))
-        cat_pts = "".join(f'<c:pt idx="{j}"><c:v>{cat}</c:v></c:pt>' for j, cat in enumerate(categories))
+        cat_pts = "".join(f'<c:pt idx="{j}"><c:v>{xml_escape(str(cat))}</c:v></c:pt>' for j, cat in enumerate(categories))
+
+        # Per-data-point colors for bar charts (each bar a different color)
+        dpt_xml = ""
+        if chart_type == "bar" and len(series) == 1:
+            for j in range(len(vals)):
+                c = CHART_COLORS[j % len(CHART_COLORS)]
+                dpt_xml += f"""<c:dPt><c:idx val="{j}"/>
+                  <c:spPr><a:solidFill><a:srgbClr val="{c}"/></a:solidFill></c:spPr>
+                </c:dPt>"""
+
+        # Series-level color for multi-series bar or line charts
+        ser_color_xml = ""
+        if chart_type == "line":
+            c = CHART_COLORS[i % len(CHART_COLORS)]
+            ser_color_xml = f"""<c:spPr>
+              <a:ln w="28575"><a:solidFill><a:srgbClr val="{c}"/></a:solidFill></a:ln>
+            </c:spPr>"""
+            marker_xml = f"""<c:marker><c:symbol val="circle"/><c:size val="6"/>
+              <c:spPr><a:solidFill><a:srgbClr val="{c}"/></a:solidFill></c:spPr>
+            </c:marker>"""
+        elif chart_type == "bar" and len(series) > 1:
+            c = CHART_COLORS[i % len(CHART_COLORS)]
+            ser_color_xml = f"""<c:spPr><a:solidFill><a:srgbClr val="{c}"/></a:solidFill></c:spPr>"""
+
         ser_blocks += f"""<c:ser>
         <c:idx val="{i}"/><c:order val="{i}"/>
         <c:tx><c:strRef><c:f>'{ws_title}'!${col_letter}${hdr_row}</c:f>
-          <c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>{sname}</c:v></c:pt></c:strCache>
+          <c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>{xml_escape(str(sname))}</c:v></c:pt></c:strCache>
         </c:strRef></c:tx>
+        {ser_color_xml}
         {marker_xml}
+        {dpt_xml}
         <c:cat><c:strRef><c:f>'{ws_title}'!$A${cat_row1}:$A${cat_rown}</c:f>
           <c:strCache><c:ptCount val="{n}"/>{cat_pts}</c:strCache>
         </c:strRef></c:cat>
@@ -283,14 +332,21 @@ def build_chart_xml(ws_title, categories, series, chart_title,
     if chart_type == "pie":
         # Pie chart — different XML structure, no axes needed
         n_series = len(series)
-        first_sname = list(series.keys())[0]
+        first_sname = xml_escape(str(list(series.keys())[0]))
         first_vals  = list(series.values())[0]
         pie_pts = "".join(
             f'<c:pt idx="{j}"><c:v>{v}</c:v></c:pt>' for j, v in enumerate(first_vals)
         )
         cat_pts = "".join(
-            f'<c:pt idx="{j}"><c:v>{cat}</c:v></c:pt>' for j, cat in enumerate(categories)
+            f'<c:pt idx="{j}"><c:v>{xml_escape(str(cat))}</c:v></c:pt>' for j, cat in enumerate(categories)
         )
+        # Per-slice colors
+        pie_dpt_xml = ""
+        for j in range(len(first_vals)):
+            c = CHART_COLORS[j % len(CHART_COLORS)]
+            pie_dpt_xml += f"""<c:dPt><c:idx val="{j}"/>
+              <c:spPr><a:solidFill><a:srgbClr val="{c}"/></a:solidFill></c:spPr>
+            </c:dPt>"""
         pie_dlbls = f"""<c:dLbls>
           <c:numFmt formatCode="0.0%" sourceLinked="0"/>
           <c:showLegendKey val="0"/><c:showVal val="0"/>
@@ -313,6 +369,7 @@ def build_chart_xml(ws_title, categories, series, chart_title,
           <c:tx><c:strRef><c:f>'{ws_title}'!$B${hdr_row}</c:f>
             <c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>{first_sname}</c:v></c:pt></c:strCache>
           </c:strRef></c:tx>
+          {pie_dpt_xml}
           {pie_dlbls}
           <c:cat><c:strRef><c:f>'{ws_title}'!$A${cat_row1}:$A${cat_rown}</c:f>
             <c:strCache><c:ptCount val="{n}"/>{cat_pts}</c:strCache>
@@ -339,8 +396,9 @@ def build_chart_xml(ws_title, categories, series, chart_title,
         <c:axId val="10"/><c:axId val="100"/>
       </c:lineChart>"""
     else:
+        vary = "1" if len(series) == 1 else "0"
         chart_block = f"""<c:barChart>
-        <c:barDir val="col"/><c:grouping val="clustered"/><c:varyColors val="0"/>
+        <c:barDir val="col"/><c:grouping val="clustered"/><c:varyColors val="{vary}"/>
         {ser_blocks}{dlbls}
         <c:gapWidth val="150"/>
         <c:axId val="10"/><c:axId val="100"/>
@@ -549,6 +607,106 @@ def export_to_excel(df, analysis, chart_path, output_path="report.xlsx",
     return output_path
 
 
+# ── Word chart image helper ──────────────────────────────────────────────────
+def _fmt_short(v, currency_symbol=""):
+    """Abbreviate large numbers: 315341396 → ₦315.3M"""
+    av = abs(v)
+    if av >= 1_000_000_000:
+        return f"{currency_symbol}{v/1_000_000_000:,.1f}B"
+    elif av >= 1_000_000:
+        return f"{currency_symbol}{v/1_000_000:,.1f}M"
+    elif av >= 1_000:
+        return f"{currency_symbol}{v/1_000:,.1f}K"
+    else:
+        return f"{currency_symbol}{v:,.0f}"
+
+
+def _render_chart_image(cd, currency_symbol="$"):
+    """Render a single chart dict to a PNG image in memory using matplotlib."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as ticker
+
+    ct = cd.get("chart_type", "bar")
+    cats = [str(c) for c in cd["categories"]]
+    series = cd["series"]
+    title = cd["title"]
+    lf = cd.get("label_format", "none")
+    csym = currency_symbol if lf == "currency" else ""
+
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+
+    if ct == "pie":
+        vals = list(series.values())[0]
+        pie_colors = ["#" + CHART_COLORS[i % len(CHART_COLORS)] for i in range(len(cats))]
+        wedges, texts, autotexts = ax.pie(
+            vals, labels=cats, autopct='%1.1f%%', colors=pie_colors,
+            textprops={'fontsize': 10})
+        for at in autotexts:
+            at.set_fontsize(9)
+            at.set_fontweight('bold')
+        ax.set_title(title, fontsize=14, fontweight='bold', pad=16)
+    elif ct == "line":
+        for i, (sname, vals) in enumerate(series.items()):
+            c = "#" + CHART_COLORS[i % len(CHART_COLORS)]
+            ax.plot(cats, vals, marker='o', linewidth=2.5, markersize=7,
+                    label=sname, color=c)
+            for j, v in enumerate(vals):
+                ax.annotate(_fmt_short(v, csym), (cats[j], v),
+                           textcoords="offset points",
+                           xytext=(0, 12), ha='center', fontsize=8,
+                           fontweight='bold')
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.set_xlabel(cd.get("x_title", ""), fontsize=10)
+        ax.set_ylabel(cd.get("y_title", ""), fontsize=10)
+        ax.yaxis.set_major_formatter(
+            ticker.FuncFormatter(lambda x, _: _fmt_short(x, csym)))
+        if len(series) > 1:
+            ax.legend()
+        ax.grid(axis='y', alpha=0.3)
+    else:  # bar
+        if len(series) == 1:
+            vals = list(series.values())[0]
+            bar_colors = ["#" + CHART_COLORS[i % len(CHART_COLORS)] for i in range(len(cats))]
+            bars = ax.bar(cats, vals, color=bar_colors, width=0.6)
+            for bar, v in zip(bars, vals):
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                       _fmt_short(v, csym),
+                       ha='center', va='bottom', fontsize=8, fontweight='bold')
+        else:
+            import numpy as np
+            x = np.arange(len(cats))
+            width = 0.8 / len(series)
+            for i, (sname, vals) in enumerate(series.items()):
+                c = "#" + CHART_COLORS[i % len(CHART_COLORS)]
+                b = ax.bar(x + i * width - 0.4 + width/2, vals, width, label=sname, color=c)
+                for bar, v in zip(b, vals):
+                    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                           _fmt_short(v, csym),
+                           ha='center', va='bottom', fontsize=7, fontweight='bold')
+            ax.set_xticks(x)
+            ax.set_xticklabels(cats)
+            ax.legend()
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.set_xlabel(cd.get("x_title", ""), fontsize=10)
+        ax.set_ylabel(cd.get("y_title", ""), fontsize=10)
+        ax.yaxis.set_major_formatter(
+            ticker.FuncFormatter(lambda x, _: _fmt_short(x, csym)))
+        ax.grid(axis='y', alpha=0.3)
+
+    if ct != "pie":
+        plt.xticks(rotation=30 if len(cats) > 4 else 0,
+                   ha='right' if len(cats) > 4 else 'center')
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=180, bbox_inches='tight',
+                facecolor='white', edgecolor='none')
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
 # ── Word export ───────────────────────────────────────────────────────────────
 def export_to_word(df, analysis, chart_path, output_path="report.docx",
                    df2=None, name1="Dataset 1", name2="Dataset 2"):
@@ -561,14 +719,29 @@ def export_to_word(df, analysis, chart_path, output_path="report.docx",
     for f in analysis.get("key_findings", []):
         doc.add_paragraph(f, style="List Bullet")
 
+    # ── Charts as images ──
     all_charts = resolve_all_charts(analysis, df)
+    currency_sym = detect_currency(analysis)
     if all_charts:
-        doc.add_heading("Chart Data — Editable", level=1)
+        doc.add_heading("Charts", level=1)
+        for cd in all_charts:
+            doc.add_heading(cd["title"], level=2)
+            try:
+                img_buf = _render_chart_image(cd, currency_symbol=currency_sym)
+                doc.add_picture(img_buf, width=Inches(6.2))
+            except Exception as e:
+                import logging
+                logging.warning(f"[word] chart render error: {e}")
+            doc.add_paragraph()  # spacing
+
+        # ── Chart data tables (for editability) ──
+        doc.add_heading("Chart Data — Editable Tables", level=1)
         for cd in all_charts:
             doc.add_heading(cd["title"], level=2)
             col_names = ["Category"] + list(cd["series"].keys())
             tbl = doc.add_table(rows=1, cols=len(col_names))
             tbl.style = "Table Grid"
+            tbl.autofit = True
             for i, col in enumerate(col_names):
                 cell = tbl.rows[0].cells[i]
                 cell.text = col
@@ -580,25 +753,31 @@ def export_to_word(df, analysis, chart_path, output_path="report.docx",
                 rc[0].text = str(cat)
                 for j, vals in enumerate(cd["series"].values()):
                     rc[j+1].text = str(round(float(vals[i]), 2)) if i < len(vals) else "0"
-            tip = doc.add_paragraph()
-            run = tip.add_run(
-                "To create an editable chart: select this table → Insert → Chart → "
-                "paste data into the spreadsheet that opens."
-            )
-            run.font.italic = True
-            run.font.size = Pt(9)
             doc.add_paragraph()
 
+    # ── Data Sample — limit to first 10 columns for readability ──
     doc.add_heading("Data Sample", level=1)
-    t = doc.add_table(rows=1, cols=len(df.columns))
+    max_cols = min(len(df.columns), 10)
+    sample_df = df.head(15)
+    if len(df.columns) > max_cols:
+        note = doc.add_paragraph()
+        run = note.add_run(f"Showing {max_cols} of {len(df.columns)} columns. Full data available in Excel export.")
+        run.font.italic = True
+        run.font.size = Pt(9)
+
+    t = doc.add_table(rows=1, cols=max_cols)
     t.style = "Table Grid"
-    for i, col in enumerate(df.columns):
-        t.rows[0].cells[i].text = str(col)
-        t.rows[0].cells[i].paragraphs[0].runs[0].font.bold = True
-    for _, row in df.head(20).iterrows():
+    t.autofit = True
+    for i in range(max_cols):
+        cell = t.rows[0].cells[i]
+        cell.text = str(df.columns[i])
+        cell.paragraphs[0].runs[0].font.bold = True
+        cell.paragraphs[0].runs[0].font.size = Pt(8)
+    for _, row in sample_df.iterrows():
         rc = t.add_row().cells
-        for i, val in enumerate(row):
-            rc[i].text = str(val)
+        for i in range(max_cols):
+            rc[i].text = str(row.iloc[i])
+            rc[i].paragraphs[0].runs[0].font.size = Pt(8)
 
     doc.save(output_path)
     return output_path
@@ -649,6 +828,7 @@ def export_to_pptx(analysis, chart_path, output_path="report.pptx",
     # Slides 4+ — One native chart per subplot
     if df is not None:
         all_charts = resolve_all_charts(analysis, df)
+        currency_sym = detect_currency(analysis)
         for cd in all_charts:
             try:
                 s = prs.slides.add_slide(prs.slide_layouts[6])
@@ -665,7 +845,7 @@ def export_to_pptx(analysis, chart_path, output_path="report.pptx",
 
                 ct = cd.get("chart_type", "bar")
                 if ct == "line":
-                    chart_type = XL_CHART_TYPE.LINE
+                    chart_type = XL_CHART_TYPE.LINE_MARKERS
                 elif ct == "pie":
                     chart_type = XL_CHART_TYPE.PIE
                 else:
@@ -675,19 +855,75 @@ def export_to_pptx(analysis, chart_path, output_path="report.pptx",
                     PInches(0.5), PInches(1.1), PInches(12.3), PInches(5.9), pptx_cd
                 ).chart
                 ch.has_legend = len(cd["series"]) > 1
-                ch.plots[0].vary_by_categories = False
 
-                # Data labels
-                if cd.get("label_format", "none") != "none":
-                    fmt_map = {"currency": "$#,##0", "number": "#,##0", "percent": "0.0%"}
+                if ct == "pie":
+                    # Pie charts: vary colors per slice, show category + percent labels
+                    ch.plots[0].vary_by_categories = True
+                    ch.has_legend = True
                     plot = ch.plots[0]
                     plot.has_data_labels = True
                     dls = plot.data_labels
-                    dls.number_format = fmt_map.get(cd.get("label_format"), "General")
+                    dls.number_format = '0.0%'
                     dls.number_format_is_linked = False
-                    dls.show_value = True
-                    dls.show_category_name = False
+                    dls.show_value = False
+                    dls.show_category_name = True
                     dls.show_series_name = False
+                    dls.show_percentage = True
+                    # Explicit slice colors
+                    series_obj = plot.series[0]
+                    for pidx in range(len(cd["categories"])):
+                        c = CHART_COLORS[pidx % len(CHART_COLORS)]
+                        pt = series_obj.points[pidx]
+                        pt.format.fill.solid()
+                        pt.format.fill.fore_color.rgb = PptxRGB(
+                            int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16))
+                else:
+                    ch.plots[0].vary_by_categories = False
+                    # Data labels for non-pie charts
+                    if cd.get("label_format", "none") != "none":
+                        fmt_map = {
+                            "currency": f"{currency_sym}#,##0",
+                            "number": "#,##0",
+                            "percent": "0.0%"
+                        }
+                        plot = ch.plots[0]
+                        plot.has_data_labels = True
+                        dls = plot.data_labels
+                        dls.number_format = fmt_map.get(cd.get("label_format"), "General")
+                        dls.number_format_is_linked = False
+                        dls.show_value = True
+                        dls.show_category_name = False
+                        dls.show_series_name = False
+
+                    # Apply colors to bar/line charts
+                    plot = ch.plots[0]
+                    if ct == "bar" and len(cd["series"]) == 1:
+                        # Single series bar: color each bar differently
+                        series_obj = plot.series[0]
+                        for pidx in range(len(cd["categories"])):
+                            c = CHART_COLORS[pidx % len(CHART_COLORS)]
+                            pt = series_obj.points[pidx]
+                            pt.format.fill.solid()
+                            pt.format.fill.fore_color.rgb = PptxRGB(
+                                int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16))
+                    else:
+                        # Multi-series bar or line: color each series
+                        for si, ser_key in enumerate(cd["series"].keys()):
+                            c = CHART_COLORS[si % len(CHART_COLORS)]
+                            series_obj = plot.series[si]
+                            if ct == "line":
+                                series_obj.format.line.fill.solid()
+                                series_obj.format.line.fill.fore_color.rgb = PptxRGB(
+                                    int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16))
+                                series_obj.format.line.width = PPt(2.5)
+                                # Marker color
+                                series_obj.marker.format.fill.solid()
+                                series_obj.marker.format.fill.fore_color.rgb = PptxRGB(
+                                    int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16))
+                            else:
+                                series_obj.format.fill.solid()
+                                series_obj.format.fill.fore_color.rgb = PptxRGB(
+                                    int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16))
 
             except Exception as e:
                 import logging

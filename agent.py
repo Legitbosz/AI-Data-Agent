@@ -199,11 +199,23 @@ def analyze_data(df, user_question, history=[]):
 
     prompt = build_prompt_single(summary, history_text, user_question)
 
-    message = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4000,
-        messages=[{"role": "user", "content": prompt}]
-    )
+    import time, logging
+
+    for attempt in range(3):
+        try:
+            message = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=4000,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            break
+        except Exception as e:
+            if "overloaded" in str(e).lower() and attempt < 2:
+                wait = (attempt + 1) * 10
+                logging.warning(f"[AGENT] API overloaded, retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
 
     result = json.loads(clean_json(message.content[0].text))
 
@@ -212,7 +224,6 @@ def analyze_data(df, user_question, history=[]):
     if computed:
         result["key_findings"] = computed
 
-    import logging
     logging.warning(f"[AGENT] charts_data: {result.get('charts_data')}")
     logging.warning(f"[AGENT] key_findings: {result.get('key_findings')}")
     return result
@@ -233,11 +244,23 @@ def analyze_two_datasets(df1, name1, df2, name2, user_question, history=[]):
 
     prompt = build_prompt_two(summary1, summary2, name1, name2, history_text, user_question)
 
-    message = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4000,
-        messages=[{"role": "user", "content": prompt}]
-    )
+    import time, logging
+
+    for attempt in range(3):
+        try:
+            message = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=4000,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            break
+        except Exception as e:
+            if "overloaded" in str(e).lower() and attempt < 2:
+                wait = (attempt + 1) * 10
+                logging.warning(f"[AGENT] API overloaded, retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
 
     result = json.loads(clean_json(message.content[0].text))
 
@@ -246,7 +269,6 @@ def analyze_two_datasets(df1, name1, df2, name2, user_question, history=[]):
     if computed:
         result["key_findings"] = computed
 
-    import logging
     logging.warning(f"[AGENT] charts_data: {result.get('charts_data')}")
     logging.warning(f"[AGENT] key_findings: {result.get('key_findings')}")
     return result
