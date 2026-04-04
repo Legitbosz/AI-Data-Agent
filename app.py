@@ -6,6 +6,7 @@ import base64
 from agent import analyze_data, analyze_two_datasets, run_analysis_code
 from exporters import export_to_excel, export_to_word, export_to_pptx
 from cleaner import clean_dataframe, get_data_quality_report
+from validator import run_full_validation, validation_summary_text, export_validation_report
 
 # ── Tesseract OCR path (Windows) ─────────────────────────────────────────────
 try:
@@ -526,6 +527,27 @@ div[role="dialog"] > div,
     background: {bg} !important;
     background-color: {bg} !important;
 }}
+/* ═══════════════════════════════════════
+   QUICK ACTION CHIPS
+═══════════════════════════════════════ */
+div[data-testid="stHorizontalBlock"] button[kind="secondary"] {{
+    border: 1.5px solid {border} !important;
+    border-radius: 20px !important;
+    background: {bg_card} !important;
+    color: {text_muted} !important;
+    font-size: 0.78rem !important;
+    font-weight: 500 !important;
+    padding: 8px 12px !important;
+    transition: all 0.2s ease !important;
+    white-space: nowrap !important;
+}}
+div[data-testid="stHorizontalBlock"] button[kind="secondary"]:hover {{
+    border-color: {accent} !important;
+    color: {accent} !important;
+    background: {bg_input} !important;
+    box-shadow: 0 2px 12px rgba(37,99,235,0.15) !important;
+    transform: translateY(-1px) !important;
+}}
 
 </style>"""
 
@@ -649,7 +671,7 @@ st.markdown(f"""
 for key, default in {
     "messages": [], "df1": None, "df2": None,
     "name1": "Dataset 1", "name2": "Dataset 2",
-    "last_analysis": None
+    "last_analysis": None, "validation_results": None
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -1004,14 +1026,129 @@ for msg in st.session_state.messages:
                     st.markdown(f"- {f}")
             if msg.get("chart") and os.path.exists(msg["chart"]):
                 st.image(msg["chart"], width=800)
+            # Re-render validation download button from history
+            if msg.get("validation_report_path") and os.path.exists(msg["validation_report_path"]):
+                with open(msg["validation_report_path"], "rb") as vf:
+                    b64 = base64.b64encode(vf.read()).decode()
+                st.markdown(f'''
+                <a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}"
+                   download="validation_report.xlsx" class="export-dl-btn export-dl-excel">
+                   📊 &nbsp; Download Validation Report
+                </a>''', unsafe_allow_html=True)
         else:
             st.write(msg["content"])
 
 question = st.chat_input("Ask a question about your data...", key="main_chat")
 
+# ── Quick action chips — shown only when data is loaded and no messages yet ──
+if st.session_state.df1 is not None and not question and len(st.session_state.messages) == 0:
+    _spacer1, _chip1, _chip2, _spacer2 = st.columns([1.5, 1, 1, 1.5])
+    with _chip1:
+        if st.button("🔍 Validate this data", key="chip_validate", use_container_width=True):
+            st.session_state._chip_query = "Validate this data"
+            st.rerun()
+    with _chip2:
+        if st.button("📊 Analyze this data", key="chip_analyze", use_container_width=True):
+            st.session_state._chip_query = "Give me a full analysis of this dataset"
+            st.rerun()
+
+# Pick up chip click from previous rerun
+if "_chip_query" in st.session_state and st.session_state._chip_query:
+    question = st.session_state._chip_query
+    st.session_state._chip_query = None
+
+# ── Validation trigger keywords ──
+import re as _re
+_VALIDATE_PATTERN = _re.compile(
+    r"\b(validat\w*|"
+    r"check\s+(for\s+)?(error|issue|qualit|duplicat|accura)\w*|"
+    r"run\s+validation|data\s+quality|error\s+(rate|check|detect)\w*|"
+    r"find\s+(error|issue|duplicat|invalid)\w*|"
+    r"duplicate\s+(check|detect)\w*|"
+    r"clean\s+check|audit|inspect\s+data|verify\s+(data|this))\b",
+    _re.IGNORECASE
+)
+
 if question:
     if st.session_state.df1 is None:
         st.warning("Please upload at least one file first.")
+    elif _VALIDATE_PATTERN.search(question):
+        # ── VALIDATION MODE — no AI call, pure local validation ──
+        st.session_state.messages.append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.write(question)
+        with st.chat_message("assistant"):
+            with st.spinner("Running validation checks across 13 functions..."):
+                vr = run_full_validation(st.session_state.df1)
+                st.session_state.validation_results = vr
+
+                # Generate summary text
+                summary = validation_summary_text(vr)
+
+                # Export to Excel
+                report_path = f"validation_report_{len(st.session_state.messages)}.xlsx"
+                export_validation_report(st.session_state.df1, vr, output_path=report_path)
+
+            # Display summary in chat
+            st.write("**Data Validation Complete**")
+            st.text(summary)
+
+            # Show score cards inline
+            overall = vr.get("overall_status", {})
+            accuracy = vr.get("data_accuracy", {})
+            err_rate_data = vr.get("error_rate", {})
+            workflow = vr.get("workflow_status", {})
+
+            score = overall.get("score", 0)
+            status_label = overall.get("status", "N/A")
+            if status_label == "CLEAN":
+                score_color = "#16a34a"
+            elif status_label == "WARNINGS":
+                score_color = "#d97706"
+            else:
+                score_color = "#dc2626"
+
+            st.markdown(f"""
+            <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:16px 0;">
+                <div style="background:{score_color}15; border:1px solid {score_color}40; border-radius:12px; padding:16px; text-align:center;">
+                    <div style="font-size:28px; font-weight:700; color:{score_color};">{score}%</div>
+                    <div style="font-size:12px; color:{score_color}; font-weight:600;">{status_label}</div>
+                    <div style="font-size:11px; opacity:0.7; margin-top:4px;">Quality Score</div>
+                </div>
+                <div style="background:#2563eb15; border:1px solid #2563eb40; border-radius:12px; padding:16px; text-align:center;">
+                    <div style="font-size:28px; font-weight:700; color:#2563eb;">{accuracy.get('overall_accuracy', 'N/A')}%</div>
+                    <div style="font-size:12px; color:#2563eb; font-weight:600;">ACCURACY</div>
+                    <div style="font-size:11px; opacity:0.7; margin-top:4px;">Data Accuracy</div>
+                </div>
+                <div style="background:#dc262615; border:1px solid #dc262640; border-radius:12px; padding:16px; text-align:center;">
+                    <div style="font-size:28px; font-weight:700; color:#dc2626;">{err_rate_data.get('overall_error_rate', 'N/A')}%</div>
+                    <div style="font-size:12px; color:#dc2626; font-weight:600;">ERROR RATE</div>
+                    <div style="font-size:11px; opacity:0.7; margin-top:4px;">Overall Errors</div>
+                </div>
+                <div style="background:#7c3aed15; border:1px solid #7c3aed40; border-radius:12px; padding:16px; text-align:center;">
+                    <div style="font-size:28px; font-weight:700; color:#7c3aed;">{workflow.get('completion_rate', 'N/A') if workflow.get('column') else 'N/A'}%</div>
+                    <div style="font-size:12px; color:#7c3aed; font-weight:600;">WORKFLOW</div>
+                    <div style="font-size:11px; opacity:0.7; margin-top:4px;">Completion Rate</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Download button
+            with open(report_path, "rb") as vf:
+                b64 = base64.b64encode(vf.read()).decode()
+            st.markdown(f'''
+            <a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}"
+               download="validation_report.xlsx" class="export-dl-btn export-dl-excel">
+               📊 &nbsp; Download Validation Report (Excel)
+            </a>''', unsafe_allow_html=True)
+
+            st.session_state.messages.append({
+                "role": "assistant",
+                "answer": "Data Validation Complete\n\n" + summary,
+                "findings": vr.get("error_notes", []),
+                "chart": None,
+                "validation_report_path": report_path,
+            })
     else:
         st.session_state.messages.append({"role": "user", "content": question})
         with st.chat_message("user"):

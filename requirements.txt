@@ -1,0 +1,11 @@
+streamlit
+pandas
+anthropic
+python-dotenv
+openpyxl
+python-docx
+python-pptx
+matplotlib
+lxml
+numpy
+pdfplumber
